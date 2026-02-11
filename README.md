@@ -108,6 +108,10 @@ Exit-Success "Component completed"
 
 For **Component Monitors**: exit 0 = healthy, exit 1 = alert.
 
+## Blog Post
+
+Read the full writeup: **[Datto RMM Toolkit: Reusable PowerShell Functions for Better Components](https://nathanash.com/posts/datto-rmm-toolkit/)**
+
 ## License
 
 MIT
