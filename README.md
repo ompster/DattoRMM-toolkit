@@ -2,9 +2,40 @@
 
 Reusable PowerShell functions for Datto RMM components. Drop these into your components or dot-source the toolkit.
 
-## What's Included
+## Structure
 
-### `DattoRMM-Toolkit.ps1`
+```
+DattoRMM-Toolkit/
+├── DattoRMM-Toolkit.ps1          # All functions in one file (paste into components)
+├── functions/                     # Individual function files (grab what you need)
+│   ├── Write-Log.ps1
+│   ├── Write-LogSection.ps1
+│   ├── Exit-Component.ps1
+│   ├── Exit-Success.ps1
+│   ├── Exit-Failure.ps1
+│   ├── Exit-NotApplicable.ps1
+│   ├── Exit-RebootRequired.ps1
+│   ├── Set-DattoUDF.ps1
+│   ├── Get-DattoUDF.ps1
+│   ├── Set-DattoUDFTimestamp.ps1
+│   ├── Get-LoggedOnUser.ps1
+│   ├── Invoke-AsLoggedOnUser.ps1
+│   ├── Get-UserRegistryPaths.ps1
+│   ├── Invoke-UserRegistryAction.ps1
+│   ├── Get-DattoVariable.ps1
+│   └── Test-DattoAgent.ps1
+├── templates/
+│   ├── Component-Template.ps1    # Standard component starter
+│   └── Monitor-Template.ps1      # Monitor with 5 examples
+├── LICENSE
+└── README.md
+```
+
+**Two ways to use it:**
+- **Full toolkit** — paste `DattoRMM-Toolkit.ps1` into your component for everything
+- **Pick and choose** — grab individual files from `functions/` for just what you need
+
+## What's Included
 
 | Function | Description |
 |---|---|
