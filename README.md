@@ -110,7 +110,7 @@ For **Component Monitors**: exit 0 = healthy, exit 1 = alert.
 
 ## Blog Post
 
-Read the full writeup: **[Datto RMM Toolkit: Reusable PowerShell Functions for Better Components](https://nathanash.com/posts/datto-rmm-toolkit/)**
+Read the full writeup: **[Datto RMM Toolkit: Reusable PowerShell Functions for Better Components](https://me.ashnet.online/blog/datto-rmm-toolkit/)**
 
 ## License
 
