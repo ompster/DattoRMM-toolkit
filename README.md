@@ -24,6 +24,8 @@ DattoRMM-Toolkit/
 │   ├── Invoke-UserRegistryAction.ps1
 │   ├── Get-DattoVariable.ps1
 │   └── Test-DattoAgent.ps1
+├── monitors/                      # Ready-to-use monitor scripts
+│   └── datto-file-protection-monitor.ps1
 ├── templates/
 │   ├── Component-Template.ps1    # Standard component starter
 │   └── Monitor-Template.ps1      # Monitor with 5 examples
@@ -61,6 +63,27 @@ DattoRMM-Toolkit/
 | **Datto Environment** | |
 | `Get-DattoVariable` | Read Datto site/component variables |
 | `Test-DattoAgent` | Verify CagService is running |
+
+## Monitors
+
+### Datto File Protection - Health Monitor
+
+Monitors Datto File Protection (Desktop and Server editions) by parsing the official Datto status XML file. Fixes two common problems with the ComStore monitor:
+
+1. **False positives** -- transient connection states (connecting, authenticating, retry) and active backups no longer trigger alerts
+2. **Alerts not auto-resolving** -- exits 0 when healthy so Datto RMM clears the alert automatically
+
+**Features:**
+- Parses Server mode (ProgramData) and Desktop/user mode (per-profile) status XML
+- Only alerts on genuine `disconnected` state, not transient states
+- Suppresses connection and staleness alerts during active backups
+- Alerts on quarantined or deleted accounts
+- Configurable backup staleness threshold (default: 72 hours)
+- Falls back to Datto service presence check when no XML exists
+
+**Variable:** `MaxHoursSinceBackup` (Integer, default: 72)
+
+Import as a Component Monitor in Datto RMM, set Output Variable to `Status`.
 
 ## Usage
 
