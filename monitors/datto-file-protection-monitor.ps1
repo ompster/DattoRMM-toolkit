@@ -126,31 +126,45 @@ try {
 
     # Desktop XML -- determine which profile to use
     # Step 1: Get the currently logged-in interactive user
+    #         Uses explorer.exe process owner (same approach as toolkit's Get-LoggedOnUser)
     $loggedInUser = $null
     $loggedInProfile = $null
     try {
-        # Query Win32_ComputerSystem for the interactive console user
-        $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
-        if ($cs.UserName) {
-            # UserName comes as DOMAIN\username -- extract just the username
-            $loggedInUser = ($cs.UserName -split '\\')[-1]
-            Write-MonitorDiagnostic "Logged-in user: $($cs.UserName)"
+        $explorer = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop |
+            Select-Object -First 1
 
-            # Match to a profile folder
-            $profilePath = Join-Path 'C:\Users' $loggedInUser
-            if (Test-Path -LiteralPath $profilePath -PathType Container) {
-                $loggedInProfile = $profilePath
+        if ($explorer) {
+            $owner = Invoke-CimMethod -InputObject $explorer -MethodName GetOwner
+            $loggedInUser = $owner.User
+            $domain = $owner.Domain
+            Write-MonitorDiagnostic "Logged-in user: $domain\$loggedInUser"
+
+            # Get profile path from registry (reliable, no guessing folder names)
+            try {
+                $userObj = New-Object System.Security.Principal.NTAccount($domain, $loggedInUser)
+                $sid = $userObj.Translate([System.Security.Principal.SecurityIdentifier]).Value
+                $loggedInProfile = Get-ItemPropertyValue "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid" -Name ProfileImagePath -ErrorAction Stop
             }
-            else {
-                # Try case-insensitive match
-                $match = Get-ChildItem -LiteralPath 'C:\Users' -Directory -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Name -eq $loggedInUser } |
-                    Select-Object -First 1
-                if ($match) { $loggedInProfile = $match.FullName }
+            catch {
+                # Fallback: match by username in C:\Users
+                $profilePath = Join-Path 'C:\Users' $loggedInUser
+                if (Test-Path -LiteralPath $profilePath -PathType Container) {
+                    $loggedInProfile = $profilePath
+                }
+                else {
+                    $match = Get-ChildItem -LiteralPath 'C:\Users' -Directory -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -eq $loggedInUser } |
+                        Select-Object -First 1
+                    if ($match) { $loggedInProfile = $match.FullName }
+                }
+            }
+
+            if ($loggedInProfile) {
+                Write-MonitorDiagnostic "Profile path: $loggedInProfile"
             }
         }
         else {
-            Write-MonitorDiagnostic "No user currently logged in"
+            Write-MonitorDiagnostic "No explorer.exe found -- no interactive user logged in"
         }
     }
     catch {
