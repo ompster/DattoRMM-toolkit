@@ -74,6 +74,7 @@ Monitors Datto File Protection (Desktop and Server editions) by parsing the offi
 2. **Alerts not auto-resolving** -- exits 0 when healthy so Datto RMM clears the alert automatically
 
 **Features:**
+- Smart XML selection for multi-user machines — only checks the logged-in user's XML to avoid false positives from unlicensed DFP instances (DFP is licensed per-user). Falls back to the most recently modified XML when nobody is logged in.
 - Parses Server mode (ProgramData) and Desktop/user mode (per-profile) status XML
 - Only alerts on genuine `disconnected` state, not transient states
 - Suppresses connection and staleness alerts during active backups
@@ -84,6 +85,8 @@ Monitors Datto File Protection (Desktop and Server editions) by parsing the offi
 **Variable:** `MaxHoursSinceBackup` (Integer, default: 72)
 
 Import as a Component Monitor in Datto RMM, set Output Variable to `Status`.
+
+> Originally developed using the [datto-rmm-agent-skill](https://github.com/ompster/datto-rmm-agent-skill) — an AI agent skill for building production-ready Datto RMM components and monitors.
 
 ## Usage
 
