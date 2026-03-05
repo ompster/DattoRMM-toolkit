@@ -14,8 +14,11 @@
          alert automatically.
 
     Detection logic:
-      - Finds status XML for Server mode (ProgramData) and/or Desktop/user mode
-        (all profiles under C:\Users\) since the monitor runs as SYSTEM.
+      - Server mode XML (ProgramData) is always evaluated if present.
+      - Desktop/user mode: evaluates ONLY the logged-in user's XML. If no user
+        is logged in, falls back to the most recently modified XML across all
+        profiles. This avoids false positives from unlicensed users — DFP is
+        licensed per-user, so a new/different user's instance won't connect.
       - ONLY alerts on agent-online = "disconnected" (not transient states).
       - Suppresses all connection and staleness alerts while a backup is active.
       - Alerts if account is quarantined or deleted (not just disabled).
@@ -35,7 +38,7 @@
 
 .NOTES
     Author: Nathan Ash
-    Version: 1.0.0
+    Version: 1.1.0
     IMPORTANT: Monitors use Write-Host exclusively. Never Write-Output.
     IMPORTANT: Monitors embed all functions. Never dot-source external files.
 #>
@@ -102,35 +105,97 @@ try {
     Write-MonitorDiagnostic "Config: MaxHoursSinceBackup=$maxHours"
 
     # ------------------------------------------------------------------
-    # 2. Build candidate XML paths
-    #    - Server mode: single well-known ProgramData path
-    #    - Desktop/user mode: one file per user profile under C:\Users\
-    #      (SYSTEM cannot use $env:USERPROFILE; must enumerate explicitly)
+    # 2. Build XML paths
+    #    - Server mode: always check ProgramData path
+    #    - Desktop/user mode: check ONLY the logged-in user's profile.
+    #      If nobody is logged in, use the most recently modified XML.
+    #      This avoids false positives from unlicensed user profiles --
+    #      DFP is licensed per-user, so other users' instances won't
+    #      connect and would falsely trigger disconnection alerts.
     # ------------------------------------------------------------------
     $serverXml  = 'C:\ProgramData\Datto\Common\Status Report - Datto File Protection Server.xml'
     $desktopRel = 'AppData\Local\Datto\Common\Status Report - Datto File Protection.xml'
 
-    $candidates = [System.Collections.Generic.List[string]]::new()
-    $candidates.Add($serverXml)
-
-    if (Test-Path -LiteralPath 'C:\Users' -PathType Container) {
-        foreach ($profile in (Get-ChildItem -LiteralPath 'C:\Users' -Directory -ErrorAction SilentlyContinue)) {
-            $candidates.Add((Join-Path $profile.FullName $desktopRel))
-        }
-    }
-
-    Write-MonitorDiagnostic "XML candidates to check: $($candidates.Count)"
-
-    # ------------------------------------------------------------------
-    # 3. Locate existing XML files
-    # ------------------------------------------------------------------
     $foundXmls = [System.Collections.Generic.List[string]]::new()
-    foreach ($path in $candidates) {
-        if (Test-Path -LiteralPath $path -PathType Leaf) {
-            $foundXmls.Add($path)
-            Write-MonitorDiagnostic "Found XML: $path"
+
+    # Server XML -- always include if present
+    if (Test-Path -LiteralPath $serverXml -PathType Leaf) {
+        $foundXmls.Add($serverXml)
+        Write-MonitorDiagnostic "Found server XML: $serverXml"
+    }
+
+    # Desktop XML -- determine which profile to use
+    # Step 1: Get the currently logged-in interactive user
+    $loggedInUser = $null
+    $loggedInProfile = $null
+    try {
+        # Query Win32_ComputerSystem for the interactive console user
+        $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+        if ($cs.UserName) {
+            # UserName comes as DOMAIN\username -- extract just the username
+            $loggedInUser = ($cs.UserName -split '\\')[-1]
+            Write-MonitorDiagnostic "Logged-in user: $($cs.UserName)"
+
+            # Match to a profile folder
+            $profilePath = Join-Path 'C:\Users' $loggedInUser
+            if (Test-Path -LiteralPath $profilePath -PathType Container) {
+                $loggedInProfile = $profilePath
+            }
+            else {
+                # Try case-insensitive match
+                $match = Get-ChildItem -LiteralPath 'C:\Users' -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -eq $loggedInUser } |
+                    Select-Object -First 1
+                if ($match) { $loggedInProfile = $match.FullName }
+            }
+        }
+        else {
+            Write-MonitorDiagnostic "No user currently logged in"
         }
     }
+    catch {
+        Write-MonitorDiagnostic "Could not determine logged-in user: $($_.Exception.Message)"
+    }
+
+    # Step 2: Select the desktop XML
+    if ($loggedInProfile) {
+        # Use the logged-in user's XML
+        $desktopXml = Join-Path $loggedInProfile $desktopRel
+        if (Test-Path -LiteralPath $desktopXml -PathType Leaf) {
+            $foundXmls.Add($desktopXml)
+            Write-MonitorDiagnostic "Using logged-in user XML: $desktopXml"
+        }
+        else {
+            Write-MonitorDiagnostic "Logged-in user has no DFP XML at: $desktopXml"
+        }
+    }
+    else {
+        # Nobody logged in -- find the most recently modified XML across all profiles
+        Write-MonitorDiagnostic "No logged-in user -- searching for most recent desktop XML"
+        $allDesktopXmls = @()
+        if (Test-Path -LiteralPath 'C:\Users' -PathType Container) {
+            foreach ($profile in (Get-ChildItem -LiteralPath 'C:\Users' -Directory -ErrorAction SilentlyContinue)) {
+                $candidate = Join-Path $profile.FullName $desktopRel
+                if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                    $allDesktopXmls += Get-Item -LiteralPath $candidate -ErrorAction SilentlyContinue
+                }
+            }
+        }
+
+        if ($allDesktopXmls.Count -gt 0) {
+            $newest = $allDesktopXmls | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            $foundXmls.Add($newest.FullName)
+            Write-MonitorDiagnostic "Using most recent desktop XML: $($newest.FullName) (modified: $($newest.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')))"
+            if ($allDesktopXmls.Count -gt 1) {
+                Write-MonitorDiagnostic "  Skipped $($allDesktopXmls.Count - 1) other profile XML(s) to avoid unlicensed user false positives"
+            }
+        }
+        else {
+            Write-MonitorDiagnostic "No desktop XML found in any profile"
+        }
+    }
+
+    Write-MonitorDiagnostic "XMLs to evaluate: $($foundXmls.Count)"
 
     # ------------------------------------------------------------------
     # 4. No XML found -- fall back to service presence check
