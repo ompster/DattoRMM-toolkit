@@ -17,12 +17,16 @@
       - Server mode XML (ProgramData) is always evaluated if present.
       - Desktop/user mode: evaluates ONLY the logged-in user's XML. If no user
         is logged in, falls back to the most recently modified XML across all
-        profiles. This avoids false positives from unlicensed users — DFP is
+        profiles. This avoids false positives from unlicensed users -- DFP is
         licensed per-user, so a new/different user's instance won't connect.
       - ONLY alerts on agent-online = "disconnected" (not transient states).
       - Suppresses all connection and staleness alerts while a backup is active.
       - Alerts if account is quarantined or deleted (not just disabled).
       - Alerts if last backup is older than MaxHoursSinceBackup (default 72 h).
+      - Checks XML last-modified time -- if XML is stale, DFP likely not running.
+      - Checks fileprotection.exe is actually running as a process.
+      - Drops a heartbeat file in the user's Documents folder each run to ensure
+        DFP always has something to back up (prevents "nothing new" false stale).
       - Falls back to a Datto service presence check when no XML exists yet.
 
 .COMPONENT
@@ -35,10 +39,12 @@
     Environment Variables:
     - $env:MaxHoursSinceBackup  [Integer]  Hours since last backup before staleness
                                            alert fires. Default: 72 (3 days).
+    - $env:MaxXmlAgeHours      [Integer]  Hours since XML was last modified before
+                                           alerting DFP is not running. Default: 4.
 
 .NOTES
     Author: Nathan Ash
-    Version: 1.1.0
+    Version: 1.2.0
     IMPORTANT: Monitors use Write-Host exclusively. Never Write-Output.
     IMPORTANT: Monitors embed all functions. Never dot-source external files.
 #>
@@ -102,7 +108,8 @@ try {
     # 1. Config
     # ------------------------------------------------------------------
     $maxHours = Get-RMMVariable -Name 'MaxHoursSinceBackup' -Type Integer -Default 72
-    Write-MonitorDiagnostic "Config: MaxHoursSinceBackup=$maxHours"
+    $maxXmlAge = Get-RMMVariable -Name 'MaxXmlAgeHours' -Type Integer -Default 4
+    Write-MonitorDiagnostic "Config: MaxHoursSinceBackup=$maxHours, MaxXmlAgeHours=$maxXmlAge"
 
     # ------------------------------------------------------------------
     # 2. Build XML paths
@@ -212,6 +219,57 @@ try {
     Write-MonitorDiagnostic "XMLs to evaluate: $($foundXmls.Count)"
 
     # ------------------------------------------------------------------
+    # 3a. Check fileprotection.exe is actually running
+    # ------------------------------------------------------------------
+    $dfpProcess = Get-Process -Name 'fileprotection' -ErrorAction SilentlyContinue
+    if ($dfpProcess) {
+        Write-MonitorDiagnostic "fileprotection.exe is running (PID: $($dfpProcess.Id))"
+    }
+    else {
+        Write-MonitorDiagnostic "fileprotection.exe is NOT running"
+    }
+
+    # ------------------------------------------------------------------
+    # 3b. Drop heartbeat file in user's Documents folder
+    #     Ensures DFP always has something new to back up, preventing
+    #     false "stale backup" alerts when no user files have changed.
+    # ------------------------------------------------------------------
+    try {
+        $heartbeatProfile = $null
+        if ($loggedInProfile) {
+            $heartbeatProfile = $loggedInProfile
+        }
+        else {
+            # No logged-in user -- use the same profile we picked for XML
+            foreach ($xmlPath in $foundXmls) {
+                if ($xmlPath -like 'C:\Users\*') {
+                    $heartbeatProfile = ($xmlPath -split '\\')[0..2] -join '\'
+                    break
+                }
+            }
+        }
+
+        if ($heartbeatProfile) {
+            $docsFolder = Join-Path $heartbeatProfile 'Documents'
+            if (Test-Path -LiteralPath $docsFolder -PathType Container) {
+                $heartbeatFile = Join-Path $docsFolder '.datto-monitor-heartbeat'
+                $heartbeatContent = "DFP Monitor Heartbeat - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                [System.IO.File]::WriteAllText($heartbeatFile, $heartbeatContent)
+                Write-MonitorDiagnostic "Heartbeat file updated: $heartbeatFile"
+            }
+            else {
+                Write-MonitorDiagnostic "Documents folder not found at: $docsFolder -- skipping heartbeat"
+            }
+        }
+        else {
+            Write-MonitorDiagnostic "No profile available for heartbeat file -- skipping"
+        }
+    }
+    catch {
+        Write-MonitorDiagnostic "Heartbeat file write failed: $($_.Exception.Message)"
+    }
+
+    # ------------------------------------------------------------------
     # 4. No XML found -- fall back to service presence check
     # ------------------------------------------------------------------
     if ($foundXmls.Count -eq 0) {
@@ -262,6 +320,27 @@ try {
 
     foreach ($xmlPath in $foundXmls) {
         Write-MonitorDiagnostic "--- Evaluating: $xmlPath ---"
+
+        # Check XML file age -- if DFP isn't running, the XML goes stale
+        try {
+            $xmlFile = Get-Item -LiteralPath $xmlPath -ErrorAction Stop
+            $xmlAgeHours = [Math]::Round(([DateTime]::Now - $xmlFile.LastWriteTime).TotalHours, 1)
+            Write-MonitorDiagnostic "  XML last modified  : $($xmlFile.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')) ($xmlAgeHours h ago)"
+
+            if ($xmlAgeHours -gt $maxXmlAge) {
+                $staleMsg = "STALE XML: Status file not updated in $xmlAgeHours h (threshold: $maxXmlAge h) -- DFP likely not running -- $xmlPath"
+                if (-not $dfpProcess) {
+                    $alertReasons.Add("$staleMsg (fileprotection.exe confirmed NOT running)")
+                }
+                else {
+                    Write-MonitorDiagnostic "  XML is stale but fileprotection.exe is running -- possible issue"
+                    $alertReasons.Add($staleMsg)
+                }
+            }
+        }
+        catch {
+            Write-MonitorDiagnostic "  Could not check XML age: $($_.Exception.Message)"
+        }
 
         # Parse XML -- catch per-file so one bad file doesn't block others
         try {
@@ -347,7 +426,18 @@ try {
     }
 
     # ------------------------------------------------------------------
-    # 6. Single decision point
+    # 6. Process-not-running check (if XML exists but process is dead)
+    # ------------------------------------------------------------------
+    if (-not $dfpProcess -and $foundXmls.Count -gt 0) {
+        # Only alert if we haven't already flagged it via stale XML
+        $alreadyFlagged = $alertReasons | Where-Object { $_ -like '*fileprotection.exe*' -or $_ -like '*STALE XML*' }
+        if (-not $alreadyFlagged) {
+            $alertReasons.Add("PROCESS DOWN: fileprotection.exe is not running (XML exists but process is dead)")
+        }
+    }
+
+    # ------------------------------------------------------------------
+    # 7. Single decision point
     # ------------------------------------------------------------------
     Write-MonitorDiagnostic "Execution time: $($stopwatch.ElapsedMilliseconds)ms"
 
