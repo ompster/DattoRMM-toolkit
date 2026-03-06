@@ -256,6 +256,7 @@ try {
                 $heartbeatContent = "DFP Monitor Heartbeat - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
                 [System.IO.File]::WriteAllText($heartbeatFile, $heartbeatContent)
                 Write-MonitorDiagnostic "Heartbeat file updated: $heartbeatFile"
+                $summaryParts.Add("heartbeat:ok")
             }
             else {
                 Write-MonitorDiagnostic "Documents folder not found at: $docsFolder -- skipping heartbeat"
@@ -326,6 +327,8 @@ try {
             $xmlFile = Get-Item -LiteralPath $xmlPath -ErrorAction Stop
             $xmlAgeHours = [Math]::Round(([DateTime]::Now - $xmlFile.LastWriteTime).TotalHours, 1)
             Write-MonitorDiagnostic "  XML last modified  : $($xmlFile.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')) ($xmlAgeHours h ago)"
+
+            $summaryParts.Add("xml-age:${xmlAgeHours}h")
 
             if ($xmlAgeHours -gt $maxXmlAge) {
                 $staleMsg = "STALE XML: Status file not updated in $xmlAgeHours h (threshold: $maxXmlAge h) -- DFP likely not running -- $xmlPath"
@@ -444,6 +447,14 @@ try {
     if ($alertReasons.Count -gt 0) {
         $alertMsg = $alertReasons -join ' | '
         Write-MonitorAlert $alertMsg
+    }
+
+    # Add process and heartbeat info to summary
+    if ($dfpProcess) {
+        $summaryParts.Add("process:running(PID:$($dfpProcess.Id))")
+    }
+    else {
+        $summaryParts.Add("process:NOT RUNNING")
     }
 
     $summary = if ($summaryParts.Count -gt 0) { $summaryParts -join ', ' } else { 'agent healthy' }
