@@ -44,7 +44,7 @@
 
 .NOTES
     Author: Nathan Ash
-    Version: 1.2.0
+    Version: 1.4.0
     IMPORTANT: Monitors use Write-Host exclusively. Never Write-Output.
     IMPORTANT: Monitors embed all functions. Never dot-source external files.
 #>
@@ -179,8 +179,40 @@ try {
     }
 
     # Step 2: Select the desktop XML
+    # When DFP desktop runs as a service, the XML may be under the service
+    # account's profile (e.g. SYSTEM profile at
+    # C:\Windows\System32\config\systemprofile) rather than C:\Users\*.
+    # We search all possible locations to handle both interactive and service modes.
+
+    # Build a list of all profile paths to search (not just C:\Users)
+    $allProfilePaths = [System.Collections.Generic.List[string]]::new()
+
+    # SYSTEM profile -- DFP desktop running as a service often runs as SYSTEM
+    $systemProfile = "$env:SystemRoot\System32\config\systemprofile"
+    if (Test-Path -LiteralPath $systemProfile -PathType Container) {
+        $allProfilePaths.Add($systemProfile)
+    }
+
+    # LocalService and NetworkService profiles
+    $serviceProfiles = @(
+        "$env:SystemRoot\ServiceProfiles\LocalService"
+        "$env:SystemRoot\ServiceProfiles\NetworkService"
+    )
+    foreach ($sp in $serviceProfiles) {
+        if (Test-Path -LiteralPath $sp -PathType Container) {
+            $allProfilePaths.Add($sp)
+        }
+    }
+
+    # All user profiles under C:\Users
+    if (Test-Path -LiteralPath 'C:\Users' -PathType Container) {
+        foreach ($profile in (Get-ChildItem -LiteralPath 'C:\Users' -Directory -ErrorAction SilentlyContinue)) {
+            $allProfilePaths.Add($profile.FullName)
+        }
+    }
+
     if ($loggedInProfile) {
-        # Use the logged-in user's XML
+        # Use the logged-in user's XML first
         $desktopXml = Join-Path $loggedInProfile $desktopRel
         if (Test-Path -LiteralPath $desktopXml -PathType Leaf) {
             $foundXmls.Add($desktopXml)
@@ -188,18 +220,20 @@ try {
         }
         else {
             Write-MonitorDiagnostic "Logged-in user has no DFP XML at: $desktopXml"
+            # Fall through to search all profiles (DFP may be running as service)
+            $loggedInProfile = $null
         }
     }
-    else {
-        # Nobody logged in -- find the most recently modified XML across all profiles
-        Write-MonitorDiagnostic "No logged-in user -- searching for most recent desktop XML"
+
+    if (-not $loggedInProfile) {
+        # No logged-in user or their profile had no XML
+        # Search all profile paths (including service accounts)
+        Write-MonitorDiagnostic "Searching all profile paths for desktop XML (including service accounts)"
         $allDesktopXmls = @()
-        if (Test-Path -LiteralPath 'C:\Users' -PathType Container) {
-            foreach ($profile in (Get-ChildItem -LiteralPath 'C:\Users' -Directory -ErrorAction SilentlyContinue)) {
-                $candidate = Join-Path $profile.FullName $desktopRel
-                if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-                    $allDesktopXmls += Get-Item -LiteralPath $candidate -ErrorAction SilentlyContinue
-                }
+        foreach ($profilePath in $allProfilePaths) {
+            $candidate = Join-Path $profilePath $desktopRel
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                $allDesktopXmls += Get-Item -LiteralPath $candidate -ErrorAction SilentlyContinue
             }
         }
 
@@ -208,25 +242,41 @@ try {
             $foundXmls.Add($newest.FullName)
             Write-MonitorDiagnostic "Using most recent desktop XML: $($newest.FullName) (modified: $($newest.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')))"
             if ($allDesktopXmls.Count -gt 1) {
-                Write-MonitorDiagnostic "  Skipped $($allDesktopXmls.Count - 1) other profile XML(s) to avoid unlicensed user false positives"
+                Write-MonitorDiagnostic "  Skipped $($allDesktopXmls.Count - 1) other XML(s) to avoid unlicensed user false positives"
             }
         }
         else {
-            Write-MonitorDiagnostic "No desktop XML found in any profile"
+            Write-MonitorDiagnostic "No desktop XML found in any profile (including service accounts)"
         }
     }
 
     Write-MonitorDiagnostic "XMLs to evaluate: $($foundXmls.Count)"
 
     # ------------------------------------------------------------------
-    # 3a. Check fileprotection.exe is actually running
+    # 3a. Check DFP is actually running (process OR service)
+    #     Desktop edition runs as fileprotection.exe (user process).
+    #     Server edition runs as a Windows service -- the process name
+    #     may differ, so we check both the process and the service.
     # ------------------------------------------------------------------
     $dfpProcess = Get-Process -Name 'fileprotection' -ErrorAction SilentlyContinue
+    $dfpService = Get-Service -ErrorAction SilentlyContinue |
+        Where-Object {
+            ($_.DisplayName -like '*Datto File Protection*' -or
+             $_.DisplayName -like '*File Protection*' -or
+             $_.Name -like '*FileProtection*' -or
+             $_.Name -like '*DFP*') -and
+            $_.Status -eq 'Running'
+        } | Select-Object -First 1
+    $dfpRunning = $null -ne $dfpProcess -or $null -ne $dfpService
+
     if ($dfpProcess) {
         Write-MonitorDiagnostic "fileprotection.exe is running (PID: $($dfpProcess.Id))"
     }
-    else {
-        Write-MonitorDiagnostic "fileprotection.exe is NOT running"
+    if ($dfpService) {
+        Write-MonitorDiagnostic "DFP service is running: '$($dfpService.DisplayName)' [$($dfpService.Name)]"
+    }
+    if (-not $dfpRunning) {
+        Write-MonitorDiagnostic "DFP is NOT running (no process, no service)"
     }
 
     # ------------------------------------------------------------------
@@ -332,11 +382,11 @@ try {
 
             if ($xmlAgeHours -gt $maxXmlAge) {
                 $staleMsg = "STALE XML: Status file not updated in $xmlAgeHours h (threshold: $maxXmlAge h) -- DFP likely not running -- $xmlPath"
-                if (-not $dfpProcess) {
-                    $alertReasons.Add("$staleMsg (fileprotection.exe confirmed NOT running)")
+                if (-not $dfpRunning) {
+                    $alertReasons.Add("$staleMsg (DFP confirmed NOT running)")
                 }
                 else {
-                    Write-MonitorDiagnostic "  XML is stale but fileprotection.exe is running -- possible issue"
+                    Write-MonitorDiagnostic "  XML is stale but DFP is running -- possible issue"
                     $alertReasons.Add($staleMsg)
                 }
             }
@@ -429,13 +479,13 @@ try {
     }
 
     # ------------------------------------------------------------------
-    # 6. Process-not-running check (if XML exists but process is dead)
+    # 6. DFP-not-running check (if XML exists but neither process nor service is alive)
     # ------------------------------------------------------------------
-    if (-not $dfpProcess -and $foundXmls.Count -gt 0) {
+    if (-not $dfpRunning -and $foundXmls.Count -gt 0) {
         # Only alert if we haven't already flagged it via stale XML
-        $alreadyFlagged = $alertReasons | Where-Object { $_ -like '*fileprotection.exe*' -or $_ -like '*STALE XML*' }
+        $alreadyFlagged = $alertReasons | Where-Object { $_ -like '*NOT running*' -or $_ -like '*STALE XML*' }
         if (-not $alreadyFlagged) {
-            $alertReasons.Add("PROCESS DOWN: fileprotection.exe is not running (XML exists but process is dead)")
+            $alertReasons.Add("DFP DOWN: Neither fileprotection.exe process nor DFP service is running (XML exists but DFP is dead)")
         }
     }
 
@@ -449,12 +499,15 @@ try {
         Write-MonitorAlert $alertMsg
     }
 
-    # Add process and heartbeat info to summary
+    # Add process/service and heartbeat info to summary
     if ($dfpProcess) {
         $summaryParts.Add("process:running(PID:$($dfpProcess.Id))")
     }
+    elseif ($dfpService) {
+        $summaryParts.Add("service:running($($dfpService.Name))")
+    }
     else {
-        $summaryParts.Add("process:NOT RUNNING")
+        $summaryParts.Add("dfp:NOT RUNNING")
     }
 
     $summary = if ($summaryParts.Count -gt 0) { $summaryParts -join ', ' } else { 'agent healthy' }
