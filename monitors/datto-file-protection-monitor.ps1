@@ -128,6 +128,10 @@ try {
     $maxXmlAge = Get-RMMVariable -Name 'MaxXmlAgeHours' -Type Integer -Default 4
     Write-MonitorDiagnostic "Config: MaxHoursSinceBackup=$maxHours, MaxXmlAgeHours=$maxXmlAge"
 
+    # Initialise collection lists early (used throughout the script)
+    $alertReasons = [System.Collections.Generic.List[string]]::new()
+    $summaryParts = [System.Collections.Generic.List[string]]::new()
+
     # ------------------------------------------------------------------
     # 2. Build XML paths
     #    - Server mode: always check ProgramData path
@@ -303,9 +307,6 @@ try {
     # Transient agent-online states that must NOT trigger an alert.
     # Only "disconnected" is a genuine failure state.
     $transientStates = @('connecting', 'authenticating', 'retry', 'low-disk-space')
-
-    $alertReasons = [System.Collections.Generic.List[string]]::new()
-    $summaryParts  = [System.Collections.Generic.List[string]]::new()
 
     # Helper: read a named field from a Datto status XML element.
     # Datto stores monitoring values as <value name="field-name">content</value>.
