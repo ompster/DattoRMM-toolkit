@@ -15,16 +15,19 @@
 
     Detection logic:
       - Server mode XML (ProgramData) is always evaluated if present.
-      - Desktop/user mode: evaluates ONLY the logged-in user's XML. If no user
-        is logged in, falls back to the most recently modified XML across all
-        profiles. This avoids false positives from unlicensed users -- DFP is
-        licensed per-user, so a new/different user's instance won't connect.
+      - Desktop/user mode: searches ALL profile paths (C:\Users\*, SYSTEM
+        profile, service account profiles) and evaluates the MOST RECENTLY
+        MODIFIED XML. This handles all DFP configurations:
+          * Standard/unified mode: XML in logged-in user's profile
+          * Service mode (deployed under named account): XML in deployment
+            user's profile (e.g. C:\Users\DeployUser\...)
+          * Service mode (LocalSystem): XML in SYSTEM profile
       - ONLY alerts on agent-online = "disconnected" (not transient states).
       - Suppresses all connection and staleness alerts while a backup is active.
       - Alerts if account is quarantined or deleted (not just disabled).
       - Alerts if last backup is older than MaxHoursSinceBackup (default 72 h).
       - Checks XML last-modified time -- if XML is stale, DFP likely not running.
-      - Checks fileprotection.exe is actually running as a process.
+      - Checks fileprotection.exe process AND DFP service (excludes shadow copy).
       - Drops a heartbeat file in the user's Documents folder each run to ensure
         DFP always has something to back up (prevents "nothing new" false stale).
       - Falls back to a Datto service presence check when no XML exists yet.
@@ -44,7 +47,7 @@
 
 .NOTES
     Author: Nathan Ash
-    Version: 1.4.0
+    Version: 2.1.0
     IMPORTANT: Monitors use Write-Host exclusively. Never Write-Output.
     IMPORTANT: Monitors embed all functions. Never dot-source external files.
 #>
@@ -82,6 +85,20 @@ function Write-MonitorAlert {
     Write-Host "Status=$Message"
     Write-Host '<-End Result->'
     exit 1
+}
+
+function Set-DattoUDF {
+    param(
+        [Parameter(Mandatory)][ValidateRange(1, 30)][int]$UDF,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Value
+    )
+    try {
+        $regPath = 'HKLM:\SOFTWARE\CentraStage'
+        $regName = "Custom$UDF"
+        if (-not (Test-Path $regPath)) { return $false }
+        Set-ItemProperty -Path $regPath -Name $regName -Value $Value -Force -ErrorAction Stop
+        return $true
+    } catch { return $false }
 }
 
 function Write-MonitorSuccess {
@@ -131,69 +148,24 @@ try {
         Write-MonitorDiagnostic "Found server XML: $serverXml"
     }
 
-    # Desktop XML -- determine which profile to use
-    # Step 1: Get the currently logged-in interactive user
-    #         Uses explorer.exe process owner (same approach as toolkit's Get-LoggedOnUser)
-    $loggedInUser = $null
-    $loggedInProfile = $null
-    try {
-        $explorer = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop |
-            Select-Object -First 1
+    # Desktop XML -- search ALL profile paths and pick the most recently modified.
+    # DFP desktop can write its XML to different locations depending on config:
+    #   - Standard/unified mode: logged-in user's profile (C:\Users\<user>\...)
+    #   - Service mode (named account): deployment user's profile (e.g. C:\Users\DeployUser\...)
+    #   - Service mode (LocalSystem): SYSTEM profile (C:\Windows\System32\config\systemprofile\...)
+    # The correct XML is always the most recently modified one -- it's the one
+    # DFP is actively updating. Stale XMLs from old unified-mode installs or
+    # unlicensed users are naturally deprioritised by recency.
 
-        if ($explorer) {
-            $owner = Invoke-CimMethod -InputObject $explorer -MethodName GetOwner
-            $loggedInUser = $owner.User
-            $domain = $owner.Domain
-            Write-MonitorDiagnostic "Logged-in user: $domain\$loggedInUser"
-
-            # Get profile path from registry (reliable, no guessing folder names)
-            try {
-                $userObj = New-Object System.Security.Principal.NTAccount($domain, $loggedInUser)
-                $sid = $userObj.Translate([System.Security.Principal.SecurityIdentifier]).Value
-                $loggedInProfile = Get-ItemPropertyValue "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid" -Name ProfileImagePath -ErrorAction Stop
-            }
-            catch {
-                # Fallback: match by username in C:\Users
-                $profilePath = Join-Path 'C:\Users' $loggedInUser
-                if (Test-Path -LiteralPath $profilePath -PathType Container) {
-                    $loggedInProfile = $profilePath
-                }
-                else {
-                    $match = Get-ChildItem -LiteralPath 'C:\Users' -Directory -ErrorAction SilentlyContinue |
-                        Where-Object { $_.Name -eq $loggedInUser } |
-                        Select-Object -First 1
-                    if ($match) { $loggedInProfile = $match.FullName }
-                }
-            }
-
-            if ($loggedInProfile) {
-                Write-MonitorDiagnostic "Profile path: $loggedInProfile"
-            }
-        }
-        else {
-            Write-MonitorDiagnostic "No explorer.exe found -- no interactive user logged in"
-        }
-    }
-    catch {
-        Write-MonitorDiagnostic "Could not determine logged-in user: $($_.Exception.Message)"
-    }
-
-    # Step 2: Select the desktop XML
-    # When DFP desktop runs as a service, the XML may be under the service
-    # account's profile (e.g. SYSTEM profile at
-    # C:\Windows\System32\config\systemprofile) rather than C:\Users\*.
-    # We search all possible locations to handle both interactive and service modes.
-
-    # Build a list of all profile paths to search (not just C:\Users)
     $allProfilePaths = [System.Collections.Generic.List[string]]::new()
 
-    # SYSTEM profile -- DFP desktop running as a service often runs as SYSTEM
+    # SYSTEM profile
     $systemProfile = "$env:SystemRoot\System32\config\systemprofile"
     if (Test-Path -LiteralPath $systemProfile -PathType Container) {
         $allProfilePaths.Add($systemProfile)
     }
 
-    # LocalService and NetworkService profiles
+    # Service account profiles
     $serviceProfiles = @(
         "$env:SystemRoot\ServiceProfiles\LocalService"
         "$env:SystemRoot\ServiceProfiles\NetworkService"
@@ -211,43 +183,26 @@ try {
         }
     }
 
-    if ($loggedInProfile) {
-        # Use the logged-in user's XML first
-        $desktopXml = Join-Path $loggedInProfile $desktopRel
-        if (Test-Path -LiteralPath $desktopXml -PathType Leaf) {
-            $foundXmls.Add($desktopXml)
-            Write-MonitorDiagnostic "Using logged-in user XML: $desktopXml"
-        }
-        else {
-            Write-MonitorDiagnostic "Logged-in user has no DFP XML at: $desktopXml"
-            # Fall through to search all profiles (DFP may be running as service)
-            $loggedInProfile = $null
+    # Find all desktop XMLs across every profile
+    $allDesktopXmls = @()
+    foreach ($profilePath in $allProfilePaths) {
+        $candidate = Join-Path $profilePath $desktopRel
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $allDesktopXmls += Get-Item -LiteralPath $candidate -ErrorAction SilentlyContinue
         }
     }
 
-    if (-not $loggedInProfile) {
-        # No logged-in user or their profile had no XML
-        # Search all profile paths (including service accounts)
-        Write-MonitorDiagnostic "Searching all profile paths for desktop XML (including service accounts)"
-        $allDesktopXmls = @()
-        foreach ($profilePath in $allProfilePaths) {
-            $candidate = Join-Path $profilePath $desktopRel
-            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-                $allDesktopXmls += Get-Item -LiteralPath $candidate -ErrorAction SilentlyContinue
-            }
+    if ($allDesktopXmls.Count -gt 0) {
+        # Pick the most recently modified XML -- this is the one DFP is actively updating
+        $newest = $allDesktopXmls | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        $foundXmls.Add($newest.FullName)
+        Write-MonitorDiagnostic "Using most recent desktop XML: $($newest.FullName) (modified: $($newest.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')))"
+        if ($allDesktopXmls.Count -gt 1) {
+            Write-MonitorDiagnostic "  Found $($allDesktopXmls.Count) desktop XML(s) total -- using newest"
         }
-
-        if ($allDesktopXmls.Count -gt 0) {
-            $newest = $allDesktopXmls | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-            $foundXmls.Add($newest.FullName)
-            Write-MonitorDiagnostic "Using most recent desktop XML: $($newest.FullName) (modified: $($newest.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')))"
-            if ($allDesktopXmls.Count -gt 1) {
-                Write-MonitorDiagnostic "  Skipped $($allDesktopXmls.Count - 1) other XML(s) to avoid unlicensed user false positives"
-            }
-        }
-        else {
-            Write-MonitorDiagnostic "No desktop XML found in any profile (including service accounts)"
-        }
+    }
+    else {
+        Write-MonitorDiagnostic "No desktop XML found in any profile"
     }
 
     Write-MonitorDiagnostic "XMLs to evaluate: $($foundXmls.Count)"
@@ -259,12 +214,17 @@ try {
     #     may differ, so we check both the process and the service.
     # ------------------------------------------------------------------
     $dfpProcess = Get-Process -Name 'fileprotection' -ErrorAction SilentlyContinue
+    # Exclude shadow copy and other auxiliary services -- only match the core DFP service.
+    # Known false matches: "Datto File Protection Shadow Copy Service"
     $dfpService = Get-Service -ErrorAction SilentlyContinue |
         Where-Object {
             ($_.DisplayName -like '*Datto File Protection*' -or
              $_.DisplayName -like '*File Protection*' -or
              $_.Name -like '*FileProtection*' -or
              $_.Name -like '*DFP*') -and
+            $_.DisplayName -notlike '*Shadow Copy*' -and
+            $_.DisplayName -notlike '*Shadow*' -and
+            $_.DisplayName -notlike '*VSS*' -and
             $_.Status -eq 'Running'
         } | Select-Object -First 1
     $dfpRunning = $null -ne $dfpProcess -or $null -ne $dfpService
@@ -286,16 +246,11 @@ try {
     # ------------------------------------------------------------------
     try {
         $heartbeatProfile = $null
-        if ($loggedInProfile) {
-            $heartbeatProfile = $loggedInProfile
-        }
-        else {
-            # No logged-in user -- use the same profile we picked for XML
-            foreach ($xmlPath in $foundXmls) {
-                if ($xmlPath -like 'C:\Users\*') {
-                    $heartbeatProfile = ($xmlPath -split '\\')[0..2] -join '\'
-                    break
-                }
+        # Use the profile from whichever XML we selected
+        foreach ($xmlPath in $foundXmls) {
+            if ($xmlPath -like 'C:\Users\*') {
+                $heartbeatProfile = ($xmlPath -split '\\')[0..2] -join '\'
+                break
             }
         }
 
@@ -490,16 +445,48 @@ try {
     }
 
     # ------------------------------------------------------------------
-    # 7. Single decision point
+    # 7. Build UDF 4 summary and final decision
     # ------------------------------------------------------------------
     Write-MonitorDiagnostic "Execution time: $($stopwatch.ElapsedMilliseconds)ms"
 
+    # Build UDF summary parts
+    $udfParts = [System.Collections.Generic.List[string]]::new()
+    foreach ($part in $summaryParts) {
+        $udfParts.Add($part)
+    }
+    if ($dfpProcess) {
+        $udfParts.Add("pid:$($dfpProcess.Id)")
+    }
+    elseif ($dfpService) {
+        $udfParts.Add("svc:$($dfpService.Name)")
+    }
+
+    # Write UDF 4
+    if ($alertReasons.Count -gt 0) {
+        $shortAlerts = foreach ($reason in $alertReasons) {
+            $reason -replace '\s*--\s*C:\\.*$', ''
+        }
+        $udfValue = "WARNING: $($shortAlerts -join ' | ')"
+    }
+    else {
+        $udfValue = "OK: $($udfParts -join ' | ')"
+    }
+    if ($udfValue.Length -gt 255) { $udfValue = $udfValue.Substring(0, 252) + '...' }
+    $udfResult = Set-DattoUDF -UDF 4 -Value $udfValue
+    if ($udfResult) {
+        Write-MonitorDiagnostic "UDF 4: $udfValue"
+    }
+    else {
+        Write-MonitorDiagnostic "UDF 4 write failed"
+    }
+
+    # Final decision
     if ($alertReasons.Count -gt 0) {
         $alertMsg = $alertReasons -join ' | '
         Write-MonitorAlert $alertMsg
     }
 
-    # Add process/service and heartbeat info to summary
+    # Add process/service info to monitor summary
     if ($dfpProcess) {
         $summaryParts.Add("process:running(PID:$($dfpProcess.Id))")
     }
